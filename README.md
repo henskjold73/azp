@@ -5,9 +5,23 @@ Manage multiple Azure CLI logins side by side. Each profile is its own
 
 Built for macOS and Linux (bash/zsh). Windows is not a target.
 
-```sh
-cargo install --path .
+## Install
 
+```sh
+brew install henskjold73/tap/azp
+```
+
+Or with the install script, which downloads a prebuilt binary into `~/.cargo/bin`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/henskjold73/azp/releases/latest/download/azp-installer.sh | sh
+```
+
+Or build from source with `cargo install --git https://github.com/henskjold73/azp`.
+
+## Usage
+
+```sh
 azp add work                 # create profile and run `az login`
 azp add client -- --tenant client.onmicrosoft.com   # extra args go to `az login`
 azp list                     # profile, user, tenant, default subscription (* = active)

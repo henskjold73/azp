@@ -1,6 +1,6 @@
 [package]
 name = "azp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Manage multiple Azure CLI logins, one config dir per profile"
 license = "MIT"

@@ -5,10 +5,12 @@ mod profile;
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -17,6 +19,7 @@ use profile::{parse_azure_profile, validate_name, ProfileInfo, AZURE_PROFILE_FIL
 
 const PROFILES_DIR: &str = ".azure-profiles";
 const CONFIG_ENV: &str = "AZURE_CONFIG_DIR";
+const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Manage multiple Azure CLI logins, one AZURE_CONFIG_DIR per profile.
 #[derive(Parser)]
@@ -35,7 +38,7 @@ enum Cmd {
         #[arg(last = true)]
         az_args: Vec<String>,
     },
-    /// List profiles with their user, tenant and default subscription
+    /// List profiles with their user, tenant, default subscription and sign-in status
     #[command(alias = "ls")]
     List,
     /// Print `export AZURE_CONFIG_DIR=...` for the profile (use with eval)
@@ -174,19 +177,83 @@ fn list() -> Result<()> {
     }
     names.sort();
 
-    let mut rows: Vec<[String; 5]> = vec![["".into(), "PROFILE".into(), "USER".into(), "TENANT".into(), "SUBSCRIPTION".into()]];
-    for name in names {
-        let dir = root.join(&name);
+    let profiles: Vec<(String, PathBuf, Result<Option<ProfileInfo>>)> = names
+        .into_iter()
+        .map(|name| {
+            let dir = root.join(&name);
+            let info = read_profile_info(&dir);
+            (name, dir, info)
+        })
+        .collect();
+
+    // Ask az about every signed-in profile in parallel; each check takes a second or two.
+    let statuses: Vec<String> = thread::scope(|s| {
+        let handles: Vec<_> = profiles
+            .iter()
+            .map(|(_, dir, info)| {
+                let signed_in = matches!(info, Ok(Some(_)));
+                s.spawn(move || if signed_in { check_status(dir) } else { String::new() })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| "check failed".into())).collect()
+    });
+
+    let mut rows: Vec<[String; 6]> = vec![[
+        "".into(),
+        "PROFILE".into(),
+        "USER".into(),
+        "TENANT".into(),
+        "SUBSCRIPTION".into(),
+        "STATUS".into(),
+    ]];
+    for ((name, dir, info), status) in profiles.into_iter().zip(statuses) {
         let marker = if is_active(&dir) { "*" } else { "" }.to_string();
-        let row = match read_profile_info(&dir) {
-            Ok(Some(ProfileInfo { user, tenant, subscription })) => [marker, name, user, tenant, subscription],
-            Ok(None) => [marker, name, "not logged in".into(), String::new(), String::new()],
-            Err(e) => [marker, name, format!("error: {e:#}"), String::new(), String::new()],
+        let row = match info {
+            Ok(Some(ProfileInfo { user, tenant, subscription })) => [marker, name, user, tenant, subscription, status],
+            Ok(None) => [marker, name, "-".into(), "-".into(), "-".into(), "signed out".into()],
+            Err(e) => [marker, name, format!("error: {e:#}"), String::new(), String::new(), String::new()],
         };
         rows.push(row);
     }
     print_table(&rows);
     Ok(())
+}
+
+/// Ask az for an access token in the profile to see whether the login still works.
+fn check_status(dir: &Path) -> String {
+    let child = Command::new("az")
+        .args(["account", "get-access-token", "--output", "none", "--only-show-errors"])
+        .env(CONFIG_ENV, dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let Ok(mut child) = child else { return "az not found".into() };
+
+    let deadline = Instant::now() + STATUS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "timed out".into();
+            }
+        }
+    };
+    if status.success() {
+        return "signed in".into();
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    if stderr.contains("az login") || stderr.contains("AADSTS") {
+        "expired".into()
+    } else {
+        "check failed".into()
+    }
 }
 
 /// Reads only `azureProfile.json`; never touches token caches.
